@@ -1,0 +1,579 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 8600
+
+    steps:
+      - name: Limpeza pesada do disco e mostrar configurações
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host " CONFIGURAÇÕES DO RUNNER"
+          Write-Host "========================================"
+
+          Write-Host "`n--- SISTEMA ---"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture |
+            Format-List
+
+          Write-Host "--- CPU ---"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            Format-List
+
+          Write-Host "--- RAM ---"
+          $ram = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("RAM total: {0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB))
+
+          Write-Host "`n--- GPU ---"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name,
+              @{N="VRAM_GB";E={
+                if ($_.AdapterRAM) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                } else {
+                  "N/A"
+                }
+              }},
+              DriverVersion |
+            Format-List
+
+          Write-Host "--- DISCO ANTES DA LIMPEZA ---"
+          Get-Volume -DriveLetter C |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}},
+              @{N="UsadoGB";E={[math]::Round(($_.Size - $_.SizeRemaining) / 1GB, 2)}} |
+            Format-List
+
+          Write-Host "`n========================================"
+          Write-Host " INICIANDO LIMPEZA PESADA"
+          Write-Host "========================================"
+
+          # Arquivos temporários do usuário
+          Remove-Item "$env:TEMP\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Arquivos temporários do Windows
+          Remove-Item "C:\Windows\Temp\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Cache do Windows Update
+          Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\SoftwareDistribution\Download\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+          Start-Service wuauserv -ErrorAction SilentlyContinue
+
+          # Relatórios de erro do Windows
+          Remove-Item "C:\ProgramData\Microsoft\Windows\WER\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Cache temporário do usuário
+          Remove-Item "$env:LOCALAPPDATA\Temp\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Cache do Chocolatey
+          if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
+              choco clean --yes
+          }
+
+          # Cache do NuGet
+          if (Get-Command dotnet.exe -ErrorAction SilentlyContinue) {
+              dotnet nuget locals all --clear
+          }
+
+          # Cache do pip
+          if (Get-Command pip.exe -ErrorAction SilentlyContinue) {
+              pip cache purge
+          }
+
+          # Cache do npm
+          if (Get-Command npm.cmd -ErrorAction SilentlyContinue) {
+              npm cache clean --force
+          }
+
+          # Limpeza de componentes antigos do Windows
+          DISM.exe /Online /Cleanup-Image /StartComponentCleanup
+
+          # Limpeza do Gerenciador de Disco
+          cleanmgr.exe /verylowdisk
+
+          Write-Host "`n========================================"
+          Write-Host " RESULTADO DA LIMPEZA"
+          Write-Host "========================================"
+
+          Get-Volume -DriveLetter C |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}},
+              @{N="UsadoGB";E={[math]::Round(($_.Size - $_.SizeRemaining) / 1GB, 2)}} |
+            Format-List
+
+          Write-Host "`n========================================"
+          Write-Host " CONFIGURAÇÕES FINAIS"
+          Write-Host "========================================"
+
+          Write-Host "`n--- CPU ---"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            Format-List
+
+          Write-Host "--- RAM ---"
+          $ram = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("RAM total: {0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB))
+
+          Write-Host "`n--- GPU ---"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name,
+              @{N="VRAM_GB";E={
+                if ($_.AdapterRAM) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                } else {
+                  "N/A"
+                }
+              }},
+              DriverVersion |
+            Format-List
+
+          Write-Host "--- DISCO ---"
+          Get-Volume -DriveLetter C |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}} |
+            Format-List
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove existing rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Allow RDP port
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart Remote Desktop
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" `
+                        -Password $securePass `
+                        -AccountNeverExpires
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      # ============================================
+      # CONFIGURAÇÃO DO D:
+      # ============================================
+      - name: Configurar D para jogos programas e arquivos pesados
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host " CONFIGURANDO D: PARA ARQUIVOS PESADOS"
+          Write-Host "========================================"
+
+          # Criar pastas principais
+          New-Item -ItemType Directory -Force -Path "D:\Games" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\Programs" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\Downloads" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\Files" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\Temp" | Out-Null
+
+          # Pasta específica de downloads do usuário RDP
+          New-Item -ItemType Directory -Force -Path "D:\Downloads\RDP" | Out-Null
+
+          # Configurar TEMP e TMP do sistema para o D:
+          [Environment]::SetEnvironmentVariable(
+              "TEMP",
+              "D:\Temp",
+              "Machine"
+          )
+
+          [Environment]::SetEnvironmentVariable(
+              "TMP",
+              "D:\Temp",
+              "Machine"
+          )
+
+          # Variáveis também para a sessão atual
+          $env:TEMP = "D:\Temp"
+          $env:TMP = "D:\Temp"
+
+          # Criar atalhos na área de trabalho do usuário RDP
+          $desktop = "C:\Users\RDP\Desktop"
+
+          # O perfil pode ainda não existir; criar somente a pasta Desktop
+          New-Item -ItemType Directory -Force -Path $desktop | Out-Null
+
+          $WshShell = New-Object -ComObject WScript.Shell
+
+          # Atalho Jogos
+          $shortcut = $WshShell.CreateShortcut("$desktop\JOGOS - D.lnk")
+          $shortcut.TargetPath = "D:\Games"
+          $shortcut.WorkingDirectory = "D:\Games"
+          $shortcut.Description = "Jogos armazenados no disco D:"
+          $shortcut.Save()
+
+          # Atalho Programas
+          $shortcut = $WshShell.CreateShortcut("$desktop\PROGRAMAS - D.lnk")
+          $shortcut.TargetPath = "D:\Programs"
+          $shortcut.WorkingDirectory = "D:\Programs"
+          $shortcut.Description = "Programas armazenados no disco D:"
+          $shortcut.Save()
+
+          # Atalho Downloads
+          $shortcut = $WshShell.CreateShortcut("$desktop\DOWNLOADS - D.lnk")
+          $shortcut.TargetPath = "D:\Downloads"
+          $shortcut.WorkingDirectory = "D:\Downloads"
+          $shortcut.Description = "Downloads armazenados no disco D:"
+          $shortcut.Save()
+
+          # Atalho Arquivos
+          $shortcut = $WshShell.CreateShortcut("$desktop\ARQUIVOS - D.lnk")
+          $shortcut.TargetPath = "D:\Files"
+          $shortcut.WorkingDirectory = "D:\Files"
+          $shortcut.Description = "Arquivos armazenados no disco D:"
+          $shortcut.Save()
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host " D: CONFIGURADO COM SUCESSO"
+          Write-Host "========================================"
+          Write-Host "Jogos:      D:\Games"
+          Write-Host "Programas:  D:\Programs"
+          Write-Host "Downloads:  D:\Downloads"
+          Write-Host "Arquivos:   D:\Files"
+          Write-Host "Temporarios: D:\Temp"
+          Write-Host ""
+          Write-Host "TEMP atual: $env:TEMP"
+          Write-Host "TMP atual:  $env:TMP"
+          Write-Host "========================================"
+
+          # Mostrar espaço disponível no D:
+          Get-Volume -DriveLetter D |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}},
+              @{N="UsadoGB";E={[math]::Round(($_.Size - $_.SizeRemaining) / 1GB, 2)}} |
+            Format-List
+
+      # ============================================
+      # GPU PARA O JOGO EDUCATIVO
+      # ============================================
+      - name: Detectar GPU
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Write-Host "========================================"
+          Write-Host " PROCURANDO GPU"
+          Write-Host "========================================"
+
+          $gpus = Get-CimInstance Win32_VideoController
+          $gpus | Select-Object Name, DriverVersion | Format-List
+
+          # Adaptadores virtuais (Hyper-V / Basic Display) não contam como GPU real
+          $real = $gpus | Where-Object { $_.Name -match "NVIDIA|AMD|Radeon|Intel" }
+
+          if ($real) {
+              Write-Host "GPU real encontrada: $($real[0].Name)"
+              "HAS_REAL_GPU=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+              Write-Host "Nenhuma GPU real neste runner. Vou instalar GPU por software (Mesa3D llvmpipe)."
+              "HAS_REAL_GPU=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Instalar GPU por software (Mesa3D llvmpipe)
+        if: env.HAS_REAL_GPU != 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        uses: ssciwr/setup-mesa-dist-win@v3
+        with:
+          version: '26.0.3'
+          build-type: 'release-msvc'
+          deployment-choice: '1'
+
+      - name: Ativar llvmpipe e verificar
+        if: env.HAS_REAL_GPU != 'true'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+          $env:GALLIUM_DRIVER = "llvmpipe"
+
+          if (Test-Path "$env:windir\System32\mesadrv.dll") {
+              Write-Host "GPU por software (Mesa3D llvmpipe) instalada com sucesso."
+          } else {
+              Write-Host "AVISO: Mesa3D não foi instalada (mesadrv.dll não encontrada)."
+          }
+
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion |
+            Format-List
+
+      # ============================================
+      # EMULADOR DE GAMES (RetroArch)
+      # ============================================
+      - name: Instalar emulador de games (RetroArch)
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          Write-Host "========================================"
+          Write-Host " INSTALANDO RETROARCH (EMULADOR)"
+          Write-Host "========================================"
+
+          $archive = "D:\Temp\RetroArch.7z"
+          $dest = "D:\Programs\RetroArch"
+
+          curl.exe -sSL --fail -o $archive "https://buildbot.libretro.com/nightly/windows/x86_64/RetroArch.7z"
+          if ($LASTEXITCODE -ne 0) { throw "Falha ao baixar o RetroArch" }
+
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          & "$env:ProgramFiles\7-Zip\7z.exe" x $archive "-o$dest" -y | Out-Null
+          Remove-Item $archive -Force -ErrorAction SilentlyContinue
+
+          $exe = Get-ChildItem $dest -Filter "retroarch.exe" -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) { throw "retroarch.exe não encontrado em $dest" }
+
+          # Atalho na área de trabalho pública (aparece para todos os usuários)
+          $WshShell = New-Object -ComObject WScript.Shell
+          $shortcut = $WshShell.CreateShortcut("C:\Users\Public\Desktop\RetroArch - Emulador.lnk")
+          $shortcut.TargetPath = $exe.FullName
+          $shortcut.WorkingDirectory = $exe.DirectoryName
+          $shortcut.Description = "Emulador de games (RetroArch)"
+          $shortcut.Save()
+
+          Write-Host "RetroArch instalado em: $($exe.DirectoryName)"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+          # Como TEMP foi movido para D:, o instalador será baixado para D:
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        run: |
+          # Bring up Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+              if ($tsIP) {
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+          Write-Host "TCP connectivity successful!"
+
+      # ============================================
+      # SUNSHINE (STREAMING PARA O MOONLIGHT)
+      # ============================================
+      - name: Instalar e configurar Sunshine (Moonlight)
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "========================================"
+          Write-Host " INSTALANDO SUNSHINE"
+          Write-Host "========================================"
+
+          $msi = "D:\Temp\Sunshine-Windows-AMD64-installer.msi"
+
+          curl.exe -sSL --fail -o $msi "https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi"
+          if ($LASTEXITCODE -ne 0) { throw "Falha ao baixar o Sunshine" }
+
+          $install = Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" `
+            -Wait -PassThru
+
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+              throw "Instalação do Sunshine falhou (código $($install.ExitCode))"
+          }
+
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+
+          $sunDir = "$env:ProgramFiles\Sunshine"
+          $sunExe = "$sunDir\sunshine.exe"
+          $confDir = "$sunDir\config"
+
+          if (-not (Test-Path $sunExe)) { throw "sunshine.exe não encontrado em $sunDir" }
+
+          # Liberar as portas do Sunshine (Moonlight)
+          netsh advfirewall firewall delete rule name="Sunshine-Tailscale-TCP" | Out-Null
+          netsh advfirewall firewall add rule name="Sunshine-Tailscale-TCP" `
+            dir=in action=allow protocol=TCP localport=47984,47989,47990,48010
+
+          netsh advfirewall firewall delete rule name="Sunshine-Tailscale-UDP" | Out-Null
+          netsh advfirewall firewall add rule name="Sunshine-Tailscale-UDP" `
+            dir=in action=allow protocol=UDP localport=47998-48000,48002,48010
+
+          # Configuração do Sunshine
+          $tsIP = $env:TAILSCALE_IP
+          New-Item -ItemType Directory -Force -Path $confDir | Out-Null
+
+          $conf = @(
+              "sunshine_name = gh-runner-$env:GITHUB_RUN_ID",
+              "origin_web_ui_allowed = wan",
+              "csrf_allowed_origins = https://${tsIP}:47990,https://${tsIP}",
+              "wan_encryption_mode = 0"
+          )
+
+          # Sem GPU real: codificar o vídeo pela CPU
+          if ($env:HAS_REAL_GPU -ne "true") {
+              $conf += "encoder = software"
+              $conf += "sw_preset = ultrafast"
+              $conf += "sw_tune = zerolatency"
+          }
+
+          $conf | Set-Content -Path "$confDir\sunshine.conf" -Encoding ASCII
+
+          # Usuário e senha do painel do Sunshine
+          $sunUser = "sunshine"
+          $sunPass = -join ((48..57) + (65..90) + (97..122) |
+              Get-Random -Count 16 |
+              ForEach-Object { [char]$_ })
+
+          & $sunExe --creds $sunUser $sunPass
+
+          # Reiniciar o Sunshine para aplicar a configuração
+          $svc = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
+          if ($svc) {
+              Restart-Service -Name "SunshineService" -Force
+          } else {
+              Start-Process $sunExe -WindowStyle Hidden
+          }
+
+          Start-Sleep -Seconds 10
+
+          $testResult = Test-NetConnection `
+            -ComputerName $tsIP `
+            -Port 47989
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host " SUNSHINE PRONTO"
+          Write-Host "========================================"
+          Write-Host "Porta 47989 acessível: $($testResult.TcpTestSucceeded)"
+          Write-Host ""
+          Write-Host "1) No Moonlight: adicionar PC com o IP $tsIP"
+          Write-Host "2) O Moonlight mostra um PIN"
+          Write-Host "3) No navegador do celular (com Tailscale ligado): https://${tsIP}:47990"
+          Write-Host "4) Entre no painel e digite o PIN na aba PIN"
+          Write-Host ""
+          Write-Host "Usuario do painel: $sunUser"
+          Write-Host "Senha do painel:   $sunPass"
+          Write-Host "========================================"
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          Write-Host "=== STORAGE ==="
+          Write-Host "Jogos:       D:\Games"
+          Write-Host "Programas:   D:\Programs"
+          Write-Host "Downloads:   D:\Downloads"
+          Write-Host "Arquivos:    D:\Files"
+          Write-Host "Temporarios: D:\Temp"
+          Write-Host "==================`n"
+
+          # Keep runner active
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
+          }
